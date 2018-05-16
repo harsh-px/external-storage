@@ -86,10 +86,10 @@ type testConfig struct {
 	// True if testing api failure
 	apiShouldFail bool
 	// The rest are set during setup
-	volUtil   *util.FakeVolumeUtil
-	apiUtil   *util.FakeAPIUtil
-	cache     *cache.VolumeCache
-	procTable *deleter.ProcTableImpl
+	volUtil        *util.FakeVolumeUtil
+	apiUtil        *util.FakeAPIUtil
+	cache          *cache.VolumeCache
+	cleanupTracker *deleter.CleanupStatusTracker
 }
 
 func TestDiscoverVolumes_Basic(t *testing.T) {
@@ -107,7 +107,7 @@ func TestDiscoverVolumes_Basic(t *testing.T) {
 		dirLayout:       vols,
 		expectedVolumes: vols,
 	}
-	d := testSetup(t, test)
+	d := testSetup(t, test, false)
 
 	d.DiscoverLocalVolumes()
 	verifyCreatedPVs(t, test)
@@ -128,7 +128,7 @@ func TestDiscoverVolumes_BasicTwice(t *testing.T) {
 		dirLayout:       vols,
 		expectedVolumes: vols,
 	}
-	d := testSetup(t, test)
+	d := testSetup(t, test, false)
 
 	d.DiscoverLocalVolumes()
 	verifyCreatedPVs(t, test)
@@ -145,7 +145,7 @@ func TestDiscoverVolumes_NoDir(t *testing.T) {
 		dirLayout:       vols,
 		expectedVolumes: vols,
 	}
-	d := testSetup(t, test)
+	d := testSetup(t, test, false)
 
 	d.DiscoverLocalVolumes()
 	verifyCreatedPVs(t, test)
@@ -159,7 +159,7 @@ func TestDiscoverVolumes_EmptyDir(t *testing.T) {
 		dirLayout:       vols,
 		expectedVolumes: vols,
 	}
-	d := testSetup(t, test)
+	d := testSetup(t, test, false)
 
 	d.DiscoverLocalVolumes()
 	verifyCreatedPVs(t, test)
@@ -180,7 +180,7 @@ func TestDiscoverVolumes_NewVolumesLater(t *testing.T) {
 		dirLayout:       vols,
 		expectedVolumes: vols,
 	}
-	d := testSetup(t, test)
+	d := testSetup(t, test, false)
 
 	d.DiscoverLocalVolumes()
 
@@ -217,7 +217,7 @@ func TestDiscoverVolumes_CreatePVFails(t *testing.T) {
 		dirLayout:       vols,
 		expectedVolumes: map[string][]*util.FakeDirEntry{},
 	}
-	d := testSetup(t, test)
+	d := testSetup(t, test, false)
 
 	d.DiscoverLocalVolumes()
 
@@ -235,7 +235,7 @@ func TestDiscoverVolumes_BadVolume(t *testing.T) {
 		dirLayout:       vols,
 		expectedVolumes: map[string][]*util.FakeDirEntry{},
 	}
-	d := testSetup(t, test)
+	d := testSetup(t, test, false)
 
 	d.DiscoverLocalVolumes()
 
@@ -269,22 +269,23 @@ func TestDiscoverVolumes_CleaningInProgress(t *testing.T) {
 		dirLayout:       vols,
 		expectedVolumes: expectedVols,
 	}
-	d := testSetup(t, test)
+	d := testSetup(t, test, false)
 
 	// Mark dir1/mount2 PV as being cleaned. This one should not get created
 	pvName := getPVName(vols["dir1"][1])
-	test.procTable.MarkRunning(pvName)
+	test.cleanupTracker.ProcTable.MarkRunning(pvName)
 
 	d.DiscoverLocalVolumes()
 	verifyCreatedPVs(t, test)
 }
 
-func testSetup(t *testing.T, test *testConfig) *Discoverer {
+func testSetup(t *testing.T, test *testConfig, useAlphaAPI bool) *Discoverer {
 	test.cache = cache.NewVolumeCache()
 	test.volUtil = util.NewFakeVolumeUtil(false /*deleteShouldFail*/, map[string][]*util.FakeDirEntry{})
 	test.volUtil.AddNewDirEntries(testMountDir, test.dirLayout)
 	test.apiUtil = util.NewFakeAPIUtil(test.apiShouldFail, test.cache)
-	test.procTable = deleter.NewProcTable()
+	test.cleanupTracker = &deleter.CleanupStatusTracker{ProcTable: deleter.NewProcTable(),
+		JobController: deleter.NewFakeJobController()}
 
 	fm := &mount.FakeMounter{
 		MountPoints: []mount.MountPoint{
@@ -303,6 +304,7 @@ func testSetup(t *testing.T, test *testConfig) *Discoverer {
 		Node:            testNode,
 		DiscoveryMap:    scMapping,
 		NodeLabelsForPV: nodeLabelsForPV,
+		UseAlphaAPI:     useAlphaAPI,
 	}
 	runConfig := &common.RuntimeConfig{
 		UserConfig: userConfig,
@@ -312,7 +314,7 @@ func testSetup(t *testing.T, test *testConfig) *Discoverer {
 		Name:       testProvisionerName,
 		Mounter:    fm,
 	}
-	d, err := NewDiscoverer(runConfig, test.procTable)
+	d, err := NewDiscoverer(runConfig, test.cleanupTracker)
 	if err != nil {
 		t.Fatalf("Error setting up test discoverer: %v", err)
 	}
@@ -331,17 +333,26 @@ func findSCName(t *testing.T, targetDir string, test *testConfig) string {
 }
 
 func verifyNodeAffinity(t *testing.T, pv *v1.PersistentVolume) {
-	affinity, err := helper.GetStorageNodeAffinityFromAnnotation(pv.Annotations)
-	if err != nil {
-		t.Errorf("Could not get node affinity from annotation: %v", err)
-		return
-	}
-	if affinity == nil {
-		t.Errorf("No node affinity found")
-		return
-	}
+	var err error
+	var volumeNodeAffinity *v1.VolumeNodeAffinity
+	var nodeAffinity *v1.NodeAffinity
+	var selector *v1.NodeSelector
 
-	selector := affinity.RequiredDuringSchedulingIgnoredDuringExecution
+	volumeNodeAffinity = pv.Spec.NodeAffinity
+	if volumeNodeAffinity == nil {
+		nodeAffinity, err = helper.GetStorageNodeAffinityFromAnnotation(pv.Annotations)
+		if err != nil {
+			t.Errorf("Could not get node affinity from annotation: %v", err)
+			return
+		}
+		if nodeAffinity == nil {
+			t.Errorf("No node affinity found")
+			return
+		}
+		selector = nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	} else {
+		selector = volumeNodeAffinity.Required
+	}
 	if selector == nil {
 		t.Errorf("NodeAffinity node selector is nil")
 		return
@@ -529,8 +540,31 @@ func TestDiscoverVolumes_NotMountPoint(t *testing.T) {
 		dirLayout:       vols,
 		expectedVolumes: expectedVols,
 	}
-	d := testSetup(t, test)
+	d := testSetup(t, test, false)
 
 	d.DiscoverLocalVolumes()
 	verifyCreatedPVs(t, test)
+}
+
+func TestUseAlphaAPI(t *testing.T) {
+	vols := map[string][]*util.FakeDirEntry{}
+	test := &testConfig{
+		dirLayout:       vols,
+		expectedVolumes: vols,
+	}
+	d := testSetup(t, test, false)
+	if d.UseAlphaAPI {
+		t.Fatal("UseAlphaAPI should be false")
+	}
+	if len(d.nodeAffinityAnn) != 0 || d.nodeAffinity == nil {
+		t.Fatal("the value nodeAffinityAnn shouldn't be set while nodeAffinity should")
+	}
+
+	d = testSetup(t, test, true)
+	if !d.UseAlphaAPI {
+		t.Fatal("UseAlphaAPI should be true")
+	}
+	if d.nodeAffinity != nil || len(d.nodeAffinityAnn) == 0 {
+		t.Fatal("the value nodeAffinityAnn should be set while nodeAffinity should not")
+	}
 }
